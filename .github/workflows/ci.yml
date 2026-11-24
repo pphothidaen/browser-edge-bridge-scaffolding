@@ -1,0 +1,140 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Syntax check worker, scripts, and shipped extension (release copy)
+        run: |
+          node --check cloudflare/worker.js
+          node --check release/chrome-extension/background.js
+          node --check release/chrome-extension/popup.js
+          node --check scripts/verify_deploy.mjs
+          node --check scripts/release.mjs
+          bash -n scripts/ci_probe.sh scripts/dod_gate.sh
+          python3 -m py_compile secretary.py packages/secretary.py packages/bridge_resilience.py scripts/build-extension.py
+
+  blueteam:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Secret leak scan (gitleaks, commits + working tree)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Dependency audit (high severity or worse)
+        run: |
+          npm audit --omit=dev --audit-level=high
+          npm audit --prefix packages/core --omit=dev --audit-level=high
+
+  redteam:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: npm ci
+      - name: Unit tests (worker + config + verify_deploy + release packaging)
+        run: npm test
+      - name: Worker coverage gate (lines >= 80%, branches >= 60%)
+        run: node --test --experimental-test-coverage --test-coverage-lines=80 --test-coverage-branches=60 test/test-cf-worker.test.mjs
+      - name: Chrome extension source/release parity check
+        run: diff -rq packages/core/browser-bridge/extension release/chrome-extension
+      - name: Core test suite & adversarial chaos tests
+        run: npm run test:core
+      - name: Python test suites (root + tests/)
+        run: |
+          python3 -m unittest discover -s . -p "test_*.py"
+          python3 -m unittest discover -s tests -p "test_*.py"
+      - name: Extension build dry-run smoke test (ephemeral dummy token)
+        env:
+          BRIDGE_AUTH_TOKEN: dummy-ci-smoke-token
+        run: |
+          TMP_EXT_DIR=$(mktemp -d)
+          trap 'rm -rf "$TMP_EXT_DIR"' EXIT
+          python3 scripts/build-extension.py --output "$TMP_EXT_DIR/built" --zip "$TMP_EXT_DIR/built.zip"
+          node --check "$TMP_EXT_DIR/built/background.js"
+          unzip -tq "$TMP_EXT_DIR/built.zip"
+
+  deploy:
+    needs: [smoke, blueteam, redteam]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Guard — run only when all 3 deploy secrets are set
+        id: guard
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BRIDGE_AUTH_TOKEN: ${{ secrets.BRIDGE_AUTH_TOKEN }}
+        run: |
+          missing=""
+          [ -z "$CLOUDFLARE_API_TOKEN" ] && missing="$missing CLOUDFLARE_API_TOKEN"
+          [ -z "$CLOUDFLARE_ACCOUNT_ID" ] && missing="$missing CLOUDFLARE_ACCOUNT_ID"
+          [ -z "$BRIDGE_AUTH_TOKEN" ] && missing="$missing BRIDGE_AUTH_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Missing deploy secret(s):$missing — skipping deploy (set all 3 via gh secret set)"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Deploy worker
+        if: steps.guard.outputs.skip == 'false'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: cloudflare
+      - name: Verify deployed worker health & auth boundary (optional when BRIDGE_WORKER_URL var is set)
+        if: steps.guard.outputs.skip == 'false' && vars.BRIDGE_WORKER_URL != ''
+        env:
+          BRIDGE_URL: ${{ vars.BRIDGE_WORKER_URL }}
+        run: node scripts/verify_deploy.mjs --url "$BRIDGE_URL"
+      - name: Build extension + zip artifact
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          BRIDGE_AUTH_TOKEN: ${{ secrets.BRIDGE_AUTH_TOKEN }}
+        run: |
+          python3 scripts/build-extension.py --output release/browser-bridge-chrome-built
+          VERSION=$(node -p "require('./release/browser-bridge-chrome-built/manifest.json').version")
+          cd release/browser-bridge-chrome-built
+          zip -qr "../browser-bridge-v${VERSION}.zip" .
+          cd ../..
+          node --check release/browser-bridge-chrome-built/background.js
+          unzip -tq "release/browser-bridge-v${VERSION}.zip"
+          echo "Created: release/browser-bridge-v${VERSION}.zip"
+          ls -la release/browser-bridge-v*.zip
+      - name: Upload extension artifact (private repositories only)
+        if: steps.guard.outputs.skip == 'false' && github.event.repository.private == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-bridge-extension
+          path: release/browser-bridge-v*.zip
+          retention-days: 30

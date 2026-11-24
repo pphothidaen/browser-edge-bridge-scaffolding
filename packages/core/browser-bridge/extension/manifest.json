@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Edge Bridge",
+  "version": "1.0.0",
+  "description": "Generic browser-session to OpenAI-compatible API & Remote MCP relay extension.",
+  "permissions": [
+    "storage",
+    "alarms",
+    "tabs",
+    "scripting",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://target.example.local/*",
+    "https://secondary.example.local/*",
+    "https://*.workers.dev/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://target.example.local/*",
+        "https://secondary.example.local/*"
+      ],
+      "js": [
+        "page.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://target.example.local/*",
+        "https://secondary.example.local/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "world": "ISOLATED",
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Browser Edge Bridge"
+  }
+}

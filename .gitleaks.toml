@@ -1,0 +1,16 @@
+# gitleaks config: extend the default rules with a targeted allowlist.
+#
+# Placeholder tokens (__BRIDGE_AUTH_TOKEN__) are used in extension sources.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allowlist for documentation examples"
+paths = [
+  '''^README\.md$''',
+  '''^CHANGELOG\.md$''',
+  '''^docs/''',
+]
+regexes = [
+  '''token-secret-example''',
+]

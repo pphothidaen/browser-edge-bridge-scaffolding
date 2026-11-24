@@ -1,0 +1,37 @@
+{
+  "name": "browser-edge-bridge-core",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "dev": "node browser-bridge/bridge/server.mjs",
+    "test": "node scripts/test.mjs",
+    "chat": "node browser-bridge/chat.mjs",
+    "agent": "node browser-bridge/agent.mjs",
+    "models": "node browser-bridge/list.mjs models",
+    "styles": "node browser-bridge/list.mjs styles",
+    "conversations": "node browser-bridge/list.mjs conversations",
+    "credits": "node browser-bridge/list.mjs credits",
+    "doctor": "node browser-bridge/doctor.mjs",
+    "setup-assistant": "node browser-bridge/setup-assistant.mjs",
+    "dev:next": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "next": "16.4.6",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.3",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

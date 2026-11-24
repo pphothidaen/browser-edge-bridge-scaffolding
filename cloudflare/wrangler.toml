@@ -1,0 +1,21 @@
+name = "browser-edge-bridge"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+[vars]
+ENVIRONMENT = "production"
+
+[durable_objects]
+bindings = [{ name = "EXT_HUB", class_name = "ExtHub" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ExtHub"]
+
+# Secrets are set via the Cloudflare dashboard or `npx wrangler secret put` —
+# NEVER commit secret values here (see docs/CONFIGURATION.md for the storage
+# policy: Doppler → Cloudflare secrets → .env, in that order).
+#   BRIDGE_SECRET   → extension channel /ext/*
+#   CLIENT_API_KEY  → API/MCP clients (Authorization: Bearer)
+# Chrome extension popup: Bridge URL = https://bridge.example.workers.dev
+# Client provider base_url = https://bridge.example.workers.dev/v1

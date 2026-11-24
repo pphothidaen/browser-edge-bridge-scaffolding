@@ -1,0 +1,1163 @@
+// Service worker: holds the long-lived connection to the local bridge and
+// routes each job into a target browser tab.
+//
+// The connection lives here rather than in the content script because an
+// https:// page talking to http://127.0.0.1 runs into mixed-content and
+// Private Network Access checks; an extension request with host_permissions
+// does not.
+const DEFAULT_BRIDGE = 'https://bridge.example.workers.dev';
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30000;
+const CYCLE_MS = 4 * 60 * 1000; // reconnect before Chrome's long-request ceiling
+const CLOUDFLARE_RETRY_DELAY_MS = 1200;
+let reconnectAttempts = 0;
+
+/**
+ * Computes Fibonacci backoff delay with randomized jitter, capped at maxDelay.
+ * Attempt 0 → ~1s, 1 → ~1s, 2 → ~2s, 3 → ~3s, 4 → ~5s, 5 → ~8s ...
+ */
+function computeReconnectDelay(attempt, base = RECONNECT_BASE_MS, max = RECONNECT_MAX_MS, randomFn = Math.random) {
+  const fib = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55];
+  const fibN = attempt < fib.length ? fib[attempt] : fib[fib.length - 1];
+  const delay = fibN * base;
+  const jitter = Math.floor(randomFn() * 1000);
+  const total = Math.min(delay + jitter, max);
+  console.log(`[Bridge] reconnect attempt ${attempt}, delay ${Math.round(total)}ms (fib=${fibN})`);
+  return total;
+}
+
+// ─── Lease Constants ──────────────────────────────────────────────────────
+const LEASE_TTL_MS = 1000;        // failover cutoff
+const HEARTBEAT_INTERVAL_MS = 250; // heartbeat renewal interval
+
+let controller = null;
+let connected = false;
+let lastError = '';
+let hubSessionEpoch = 0;
+const jobTabs = new Map();
+
+// Protocol v2 bridge channel
+let bridgeController = null;
+let bridgeConnected = false;
+
+// A Cloudflare 403 is an edge/session failure, not an application response.
+// Reloading the logged-in chat tab refreshes the challenge/cookies, after
+// which the original request can be attempted once without asking the user to
+// manually repair the tab. Never retry a response that contains application
+// content: a second POST could spend credits twice.
+function isCloudflareForbidden(message) {
+  const text = String(message ?? '');
+  return /(?:returned|status) 403\b/i.test(text)
+    && /cloudflare|cf-ray|attention required/i.test(text);
+}
+
+// The content script's keepalive port only exists while a target tab is
+// open. With no tab the worker is evicted, the SSE stream dies with it, and the
+// bridge reports the extension as gone until the one-minute alarm revives it —
+// so an offscreen document holds a port of its own, which is a context Chrome
+// does not discard.
+let offscreenSetup = null;
+
+function ensureOffscreenDocument() {
+  if (typeof chrome.offscreen === 'undefined') return Promise.resolve();
+  if (offscreenSetup) return offscreenSetup;
+  offscreenSetup = (async () => {
+    try {
+      if (await chrome.offscreen.hasDocument?.()) return;
+      await chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: ['BLOBS'],
+        justification: 'Holds a port open so the service worker survives while no target tab is open',
+      });
+    } catch (err) {
+      if (!/single offscreen document/i.test(String(err?.message ?? err))) {
+        console.warn('[bridge-bg] offscreen document:', err);
+      }
+    } finally {
+      offscreenSetup = null;
+    }
+  })();
+  return offscreenSetup;
+}
+
+const bridgeUrl = async () => {
+  try {
+    const res = await chrome.storage.local.get(['bridgeUrl', 'userConfigured']);
+    const val = res?.bridgeUrl ? String(res.bridgeUrl).trim() : '';
+    if (!val || (!res?.userConfigured && (val === 'http://127.0.0.1:8787' || val === 'http://localhost:8787'))) {
+      return DEFAULT_BRIDGE;
+    }
+    return val;
+  } catch {
+    return DEFAULT_BRIDGE;
+  }
+};
+
+// Optional shared secret for remote bridges (e.g. Cloudflare Worker hub).
+// Sent as a header on every request; the local bridge ignores it.
+// Injected at build time by scripts/build-extension.py (Doppler → env).
+// A remaining __…__ placeholder means "not built": send no token header and
+// let the worker answer 401 (fail fast, never fabricate a secret).
+const DEFAULT_REMOTE_TOKEN = '__BRIDGE_AUTH_TOKEN__';
+
+const isUnresolvedToken = (t) => !t || /^__.*__$/.test(t);
+
+const bridgeToken = async () => {
+  try {
+    const res = await chrome.storage.local.get('bridgeToken');
+    const val = res?.bridgeToken ? String(res.bridgeToken).trim() : '';
+    if (val && !isUnresolvedToken(val)) return val;
+  } catch {
+    // storage unavailable — fall through to the built-in token
+  }
+  return isUnresolvedToken(DEFAULT_REMOTE_TOKEN) ? '' : DEFAULT_REMOTE_TOKEN;
+};
+
+async function authHeaders() {
+  const token = await bridgeToken();
+  const safeToken = token ? String(token).replace(/[^\x00-\xFF]/g, '') : '';
+  return safeToken ? { 'content-type': 'application/json', 'x-bridge-token': safeToken }
+                   : { 'content-type': 'application/json' };
+}
+
+async function post(path, body) {
+  try {
+    const payload = (hubSessionEpoch && body && typeof body === 'object' && body.sessionEpoch == null)
+      ? { ...body, sessionEpoch: hubSessionEpoch }
+      : body;
+    const res = await fetch(`${await bridgeUrl()}${path}`, {
+      method: 'POST',
+      headers: await authHeaders(),
+      body: JSON.stringify(payload),
+    });
+    // Retrying would duplicate deltas, so a refused post is surfaced, not
+    // repeated — without this a rejected body (too large, unknown job) vanished
+    // and the caller waited out its timeout for a reply that never came.
+    if (!res.ok) {
+      lastError = `bridge refused ${path} with ${res.status}`;
+      console.warn('[bridge-bg] POST rejected:', path, res.status);
+    }
+  } catch (err) {
+    lastError = String(err?.message ?? err);
+    console.warn('[bridge-bg] POST error:', path, lastError);
+  }
+}
+
+async function postBridge(body) {
+  try {
+    const res = await fetch(`${await bridgeUrl()}/bridge/message`, {
+      method: 'POST',
+      headers: await authHeaders(),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) console.warn('[bridge-bg] bridge message rejected:', res.status);
+  } catch (err) {
+    console.warn('[bridge-bg] bridge message error:', String(err?.message ?? err));
+  }
+}
+
+async function refreshModels() {
+  try {
+    const res = await fetch(`${await bridgeUrl()}/ext/models/refresh`, {
+      method: 'POST',
+      headers: await authHeaders(),
+      body: '{}',
+    });
+    if (!res.ok) console.warn('[bridge-bg] model refresh rejected:', res.status);
+  } catch (err) {
+    // The bridge continues serving its persistent/static model fallback.
+    console.warn('[bridge-bg] model refresh unavailable:', String(err?.message ?? err));
+  }
+}
+
+// Discovered models cache per site
+const siteModels = {
+  primary: [
+    { id: 'model-example', name: 'Default Model', free: true, kind: 'chat', provider: 'Primary Provider' },
+    { id: 'model-fast', name: 'Fast Model', free: true, kind: 'chat', provider: 'Primary Provider' },
+    { id: 'auto', name: 'Auto', free: true, kind: 'chat', provider: 'Primary Provider' },
+    { id: 'model-reasoning', name: 'Reasoning Model', free: false, kind: 'chat', provider: 'Primary Provider' },
+  ],
+  secondary: [
+    { id: 'model-secondary-example', name: 'Secondary Model', free: true, kind: 'chat', provider: 'Secondary Provider' },
+  ],
+};
+
+function parseHostname(url) {
+  if (!url) return '';
+  try {
+    return new URL(String(url)).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function isSecondaryUrl(url) {
+  const host = parseHostname(url);
+  return host === 'secondary.example.local' || host.endsWith('.secondary.example.local');
+}
+
+function isPrimaryUrl(url) {
+  const host = parseHostname(url);
+  return host === 'target.example.local' || host.endsWith('.target.example.local');
+}
+
+function isSecondaryModel(modelId) {
+  if (!modelId) return false;
+  const mid = String(modelId).toLowerCase();
+  return mid.includes('secondary') || mid.startsWith('secondary/') || mid.startsWith('secondary:');
+}
+
+function getProviderForModel(modelId) {
+  if (!modelId) return 'primary';
+  const mid = String(modelId).toLowerCase();
+  if (mid.startsWith('secondary:') || mid.startsWith('secondary/')) return 'secondary';
+  if (mid.startsWith('primary:') || mid.startsWith('primary/')) return 'primary';
+  if (isSecondaryModel(mid)) return 'secondary';
+  const inSecondary = (siteModels.secondary || []).some((m) => m.id.toLowerCase() === mid);
+  const inPrimary = (siteModels.primary || []).some((m) => m.id.toLowerCase() === mid);
+  if (inSecondary && !inPrimary) return 'secondary';
+  return 'primary';
+}
+
+async function getDefaultModel() {
+  try {
+    const saved = await chrome.storage.local.get(['defaultModel']);
+    if (saved?.defaultModel) return saved.defaultModel;
+  } catch {}
+  return 'model-example';
+}
+
+async function getPagesStatus() {
+  const [primaryTabs, secondaryTabs] = await Promise.all([
+    chrome.tabs.query({ url: ['https://target.example.local/*'] }).catch(() => []),
+    chrome.tabs.query({ url: ['https://secondary.example.local/*'] }).catch(() => []),
+  ]);
+
+  const isLive = (t) => t && !t.discarded && t.status !== 'unloaded';
+  const primaryLive = primaryTabs.filter(isLive);
+  const secondaryLive = secondaryTabs.filter(isLive);
+
+  const primaryTab = primaryLive[0] || primaryTabs[0] || null;
+  const secondaryTab = secondaryLive[0] || secondaryTabs[0] || null;
+
+  return {
+    primary: {
+      id: 'primary',
+      name: 'Primary Provider',
+      url: 'https://target.example.local/chat',
+      online: Boolean(primaryTab && (!primaryTab.discarded || primaryLive.length > 0)),
+      tabId: primaryTab?.id ?? null,
+      tabUrl: primaryTab?.url ?? null,
+      models: siteModels.primary || [],
+    },
+    secondary: {
+      id: 'secondary',
+      name: 'Secondary Provider',
+      url: 'https://secondary.example.local/',
+      online: Boolean(secondaryTab && (!secondaryTab.discarded || secondaryLive.length > 0)),
+      tabId: secondaryTab?.id ?? null,
+      tabUrl: secondaryTab?.url ?? null,
+      models: siteModels.secondary || [],
+    },
+  };
+}
+
+async function reportPagesToHub() {
+  if (!connected) return;
+  try {
+    const pages = await getPagesStatus();
+    await post('/ext/tab', {
+      pages: {
+        primary: { online: pages.primary.online, tabId: pages.primary.tabId },
+        secondary: { online: pages.secondary.online, tabId: pages.secondary.tabId },
+      },
+    });
+  } catch { /* best-effort tab status sync */ }
+}
+
+// P3: Periodic Tab Health Probe — actively ping attached tabs to detect frozen or unresponsive DOM
+let tabHealthProbeInterval = null;
+async function probeTabHealth() {
+  if (!connected) return;
+  try {
+    const pages = await getPagesStatus();
+    if (pages.primary?.online && pages.primary.tabId != null) {
+      try {
+        await chrome.tabs.sendMessage(pages.primary.tabId, { type: 'ping' });
+      } catch {
+        console.warn(`[bridge-bg] primary tab ${pages.primary.tabId} unresponsive during health probe`);
+        tabCoordinator.removeTab(pages.primary.tabId);
+      }
+    }
+    if (pages.secondary?.online && pages.secondary.tabId != null) {
+      try {
+        await chrome.tabs.sendMessage(pages.secondary.tabId, { type: 'ping' });
+      } catch {
+        console.warn(`[bridge-bg] secondary tab ${pages.secondary.tabId} unresponsive during health probe`);
+        secondaryPorts.delete(pages.secondary.tabId);
+      }
+    }
+    await reportPagesToHub();
+  } catch { /* best-effort */ }
+}
+
+function startTabHealthProbe(intervalMs = 30_000) {
+  if (tabHealthProbeInterval) clearInterval(tabHealthProbeInterval);
+  tabHealthProbeInterval = setInterval(probeTabHealth, intervalMs);
+}
+
+async function findPrimaryTab() {
+  const leaderTabId = tabCoordinator.getLeaderTabId();
+  if (leaderTabId != null) {
+    try {
+      const tab = await chrome.tabs.get(leaderTabId);
+      if (tab && !tab.discarded && isPrimaryUrl(tab.url)) return tab;
+    } catch {
+      tabCoordinator.removeTab(leaderTabId);
+    }
+  }
+  const tabs = await chrome.tabs.query({
+    url: ['https://target.example.local/*'],
+  }).catch(() => []);
+  if (!tabs.length) return null;
+  const live = tabs.filter((t) => !t.discarded && t.status !== 'unloaded');
+  const pool = live.length ? live : tabs;
+  return pool.find((t) => t.url?.includes('/chat')) ?? pool[0];
+}
+
+async function findSecondaryTab() {
+  const tabs = await chrome.tabs.query({
+    url: ['https://secondary.example.local/*'],
+  }).catch(() => []);
+  if (!tabs.length) return null;
+  const live = tabs.filter((t) => !t.discarded && t.status !== 'unloaded');
+  const pool = live.length ? live : tabs;
+  return pool[0] || null;
+}
+
+async function findChatTab(forModel = null) {
+  const targetModel = forModel || (await getDefaultModel());
+  const provider = getProviderForModel(targetModel);
+  if (provider === 'secondary') {
+    return await findSecondaryTab();
+  }
+  return await findPrimaryTab();
+}
+
+function waitForComplete(tabId, timeoutMs = 15_000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(onUpdated); reject(new Error('tab did not finish loading')); }, timeoutMs);
+    function onUpdated(id, info) {
+      if (id !== tabId || info.status !== 'complete') return;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve();
+    }
+    chrome.tabs.onUpdated.addListener(onUpdated);
+  });
+}
+
+async function ensureContentScript(tab) {
+  const ping = () => chrome.tabs.sendMessage(tab.id, { type: 'ping' });
+  let ok = false;
+  try { await ping(); ok = true; } catch { /* not there yet */ }
+
+  if (!ok && (tab.discarded || tab.status === 'unloaded')) {
+    await chrome.tabs.reload(tab.id);
+    await waitForComplete(tab.id);
+  }
+
+  if (!ok) {
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'MAIN', files: ['page.js'] }).catch(() => {});
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'ISOLATED', files: ['content.js'] }).catch(() => {});
+    await ping();
+  }
+}
+
+async function handleJob(job) {
+  let targetModel = job.modelId || job.model;
+  if (!targetModel) {
+    targetModel = await getDefaultModel();
+  }
+  const provider = getProviderForModel(targetModel);
+  const isSecondaryJob = (provider === 'secondary');
+
+  let tab = null;
+  if (isSecondaryJob) {
+    tab = await findSecondaryTab();
+  } else {
+    tab = await findPrimaryTab();
+  }
+
+  if (!tab) {
+    const errorMsg = provider === 'secondary'
+      ? 'no secondary provider tab is open (please open https://secondary.example.local/)'
+      : 'no primary target tab is open (please open https://target.example.local/chat)';
+    await post('/ext/error', { jobId: job.jobId, message: errorMsg });
+    return;
+  }
+  post('/ext/tab', { tabId: tab.id, url: tab.url, jobId: job.jobId, kind: job.kind });
+  jobTabs.set(job.jobId, { tabId: tab.id, job, provider, cloudflareRetried: false });
+  try {
+    await ensureContentScript(tab);
+    if (hubSessionEpoch) {
+      await chrome.tabs.sendMessage(tab.id, { type: 'SESSION_READY', sessionEpoch: hubSessionEpoch }).catch(() => {});
+    }
+    await chrome.tabs.sendMessage(tab.id, { type: 'run', job });
+  } catch (err) {
+    jobTabs.delete(job.jobId);
+    await post('/ext/error', {
+      jobId: job.jobId,
+      message: `could not reach the active tab (${tab.url ?? tab.id}): ${err?.message ?? err}`,
+    });
+  }
+}
+
+async function retryAfterCloudflare(jobId, message) {
+  const record = jobTabs.get(jobId);
+  if (!record || record.cloudflareRetried || !isCloudflareForbidden(message)) return false;
+  // A page job has no content yet when the HTTP request itself was denied, so
+  // this is the one case where replaying the POST is safe enough to automate.
+  if (!['chat', 'create', 'loader', 'native', 'direct'].includes(record.job.kind)) return false;
+  record.cloudflareRetried = true;
+
+  try {
+    await chrome.tabs.reload(record.tabId);
+    await waitForComplete(record.tabId, 30_000);
+    await new Promise((resolve) => setTimeout(resolve, CLOUDFLARE_RETRY_DELAY_MS));
+    const tab = await chrome.tabs.get(record.tabId);
+    await ensureContentScript(tab);
+    await chrome.tabs.sendMessage(record.tabId, { type: 'run', job: record.job });
+    console.warn('[bridge-bg] Cloudflare 403 recovered by reloading the chat tab');
+    return true;
+  } catch (err) {
+    console.warn('[bridge-bg] Cloudflare recovery failed:', String(err?.message ?? err));
+    return false;
+  }
+}
+
+function handleEvent(name, data) {
+  if (name === 'ready') {
+    if (data?.sessionEpoch) {
+      hubSessionEpoch = Number(data.sessionEpoch) || 0;
+      void tabCoordinator.setSessionEpoch(hubSessionEpoch, false);
+      for (const [, port] of secondaryPorts) {
+        try { port.postMessage({ type: 'SESSION_READY', sessionEpoch: hubSessionEpoch }); } catch {}
+      }
+    }
+    void reportPagesToHub();
+  } else if (name === 'job') handleJob(data);
+  else if (name === 'abort') {
+    const tabId = jobTabs.get(data.jobId)?.tabId;
+    if (tabId != null) chrome.tabs.sendMessage(tabId, { type: 'abort', jobId: data.jobId }).catch(() => {});
+    jobTabs.delete(data.jobId);
+  } else if (name === 'reload_extension') {
+    try { chrome.runtime.reload(); } catch { /* ignore */ }
+  } else if (name === 'reload_tab') {
+    (async () => {
+      const tab = await findChatTab();
+      if (tab) chrome.tabs.reload(tab.id).catch(() => {});
+    })();
+  }
+}
+
+async function connect() {
+  if (controller) return;
+  controller = new AbortController();
+  const signal = controller.signal;
+  const cycle = setTimeout(() => controller?.abort(), CYCLE_MS);
+
+  ensureOffscreenDocument();
+
+  try {
+    const token = await bridgeToken();
+    const safeToken = token ? String(token).replace(/[^\x00-\xFF]/g, '') : '';
+    const headers = safeToken
+      ? { accept: 'text/event-stream', 'x-bridge-token': safeToken }
+      : { accept: 'text/event-stream' };
+    const res = await fetch(`${await bridgeUrl()}/ext/events`, {
+      headers,
+      signal,
+    });
+    if (!res.ok || !res.body) throw new Error(`bridge responded ${res.status}`);
+
+    connected = true;
+    reconnectAttempts = 0;
+    lastError = '';
+    void reportPagesToHub();
+    void refreshModels();
+    startTabHealthProbe();
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = '';
+
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, { stream: true });
+
+      let cut;
+      while ((cut = pending.search(/\r?\n\r?\n/)) !== -1) {
+        const frame = pending.slice(0, cut);
+        pending = pending.slice(cut + pending.slice(cut).match(/^\r?\n\r?\n/)[0].length);
+
+        let name = 'message';
+        const dataLines = [];
+        for (const line of frame.split(/\r?\n/)) {
+          if (line.startsWith('event:')) name = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+        }
+        if (!dataLines.length) continue; // comment / keepalive
+        try { handleEvent(name, JSON.parse(dataLines.join('\n'))); } catch { /* ignore */ }
+      }
+    }
+  } catch (err) {
+    if (err?.name !== 'AbortError') lastError = String(err?.message ?? err);
+  } finally {
+    clearTimeout(cycle);
+    if (tabHealthProbeInterval) {
+      clearInterval(tabHealthProbeInterval);
+      tabHealthProbeInterval = null;
+    }
+    connected = false;
+    controller = null;
+    setTimeout(connect, computeReconnectDelay(reconnectAttempts++));
+  }
+}
+
+async function handleBridgeEvent(name, data) {
+  // Protocol v2 messages from BridgeDO
+  if (name === 'EXECUTE_REQUEST' || name === 'PREPARE_MODEL' || name === 'CANCEL_REQUEST') {
+    const targetModel = data.model || data.modelId || (await getDefaultModel());
+    const provider = getProviderForModel(targetModel);
+    let tab = null;
+    if (provider === 'secondary') {
+      tab = await findSecondaryTab();
+    } else {
+      tab = await findPrimaryTab();
+    }
+    if (!tab) {
+      // Report error back to bridge channel
+      const errorMsg = provider === 'secondary'
+        ? 'no secondary provider tab is open'
+        : 'no primary target tab is open';
+      await postBridge({ type: 'STREAM_ERROR', requestId: data.requestId, error: errorMsg, code: 'no_tab' });
+      return;
+    }
+    try {
+      await ensureContentScript(tab);
+      await chrome.tabs.sendMessage(tab.id, { type: name, ...data });
+    } catch (err) {
+      await postBridge({ type: 'STREAM_ERROR', requestId: data.requestId, error: `could not reach tab: ${err?.message ?? err}`, code: 'tab_unreachable' });
+    }
+  } else if (name === 'SESSION_READY') {
+    // BridgeDO assigned session epoch — forward to leader tab
+    const leaderTabId = tabCoordinator.getLeaderTabId();
+    let tab = null;
+    if (leaderTabId != null) {
+      try { tab = await chrome.tabs.get(leaderTabId); } catch { /* failover below */ }
+    }
+    if (!tab) tab = await findPrimaryTab();
+    await tabCoordinator.setSessionEpoch(data.sessionEpoch, false);
+    if (tab) {
+      try {
+        await chrome.tabs.sendMessage(tab.id, {
+          type: 'coordinator-role', role: 'leader', sessionEpoch: data.sessionEpoch,
+        });
+      } catch { /* tab not ready yet */ }
+    }
+  } else if (name === 'PING') {
+    await postBridge({ type: 'PONG' });
+  }
+}
+
+async function connectBridge() {
+  const url = await bridgeUrl();
+  // Protocol v2 /bridge channel is for local stateful bridge (127.0.0.1 or localhost);
+  // Cloudflare worker hub uses /ext/events (handled by connect()).
+  if (!url.startsWith('http://127.0.0.1') && !url.startsWith('http://localhost')) {
+    return;
+  }
+  if (bridgeController) return;
+  bridgeController = new AbortController();
+  const signal = bridgeController.signal;
+  const cycle = setTimeout(() => bridgeController?.abort(), CYCLE_MS);
+
+  try {
+    const token = await bridgeToken();
+    const res = await fetch(`${await bridgeUrl()}/bridge`, {
+      headers: token
+        ? { accept: 'text/event-stream', 'x-bridge-token': token }
+        : { accept: 'text/event-stream' },
+      signal,
+    });
+    if (!res.ok || !res.body) throw new Error(`bridge channel responded ${res.status}`);
+
+    bridgeConnected = true;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = '';
+
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, { stream: true });
+
+      let cut;
+      while ((cut = pending.search(/\r?\n\r?\n/)) !== -1) {
+        const frame = pending.slice(0, cut);
+        pending = pending.slice(cut + pending.slice(cut).match(/^\r?\n\r?\n/)[0].length);
+
+        let name = 'message';
+        const dataLines = [];
+        for (const line of frame.split(/\r?\n/)) {
+          if (line.startsWith('event:')) name = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+        }
+        if (!dataLines.length) continue;
+        try { handleBridgeEvent(name, JSON.parse(dataLines.join('\n'))); } catch { /* ignore */ }
+      }
+    }
+  } catch (err) {
+    if (err?.name !== 'AbortError') {
+      console.warn('[bridge-bg] bridge channel error:', String(err?.message ?? err));
+    }
+  } finally {
+    clearTimeout(cycle);
+    bridgeConnected = false;
+    bridgeController = null;
+    setTimeout(connectBridge, computeReconnectDelay(reconnectAttempts++));
+  }
+}
+
+// ─── Lease-Based TabCoordinator ───────────────────────────────────────────
+// TTL lease leader election with state machine:
+//   ACQUIRE_LEASE → HEARTBEAT (loop) → YIELD | REVOKED
+// Single active leader at any time. Lease persisted to chrome.storage.session.
+// STRICT ISOLATION: TabCoordinator only manages primary tabs to prevent Split-Brain (RED-1).
+// Secondary tabs are tracked separately in secondaryPorts and NEVER participate in lease election.
+const secondaryPorts = new Map(); // tabId -> port for secondary tabs
+
+const tabCoordinator = {
+  ports: new Map(),   // tabId -> port (strictly primary tabs only)
+  leaderId: null,
+  leaseExpiry: 0,
+  sessionEpoch: 0,
+  heartbeatTimer: null,
+
+  // ─── Lease State Machine ───────────────────────────────────────────────
+
+  // ACQUIRE_LEASE: A tab requests to become leader. Succeeds if no leader,
+  // lease expired, or the same tab re-acquiring.
+  async acquireLease(tabId) {
+    try {
+      const port = this.ports.get(tabId);
+      const senderUrl = port?.sender?.tab?.url || port?.sender?.url || '';
+      if (isSecondaryUrl(senderUrl) || secondaryPorts.has(tabId)) return false;
+
+      const data = await chrome.storage.session.get(['leaderTabId', 'leaseExpiry']);
+      const now = Date.now();
+      const noLeader = !data.leaderTabId;
+      const leaseExpired = data.leaseExpiry != null && data.leaseExpiry < now;
+      const isCurrentLeader = data.leaderTabId === tabId;
+
+      if (!noLeader && !leaseExpired && !isCurrentLeader) return false;
+
+      const expiry = now + LEASE_TTL_MS;
+      this.leaderId = tabId;
+      this.leaseExpiry = expiry;
+      if (!this.sessionEpoch) this.sessionEpoch = now;
+
+      await chrome.storage.session.set({
+        leaderTabId: tabId,
+        leaseExpiry: expiry,
+        sessionEpoch: this.sessionEpoch,
+      });
+
+      this.notifyRole(tabId, 'leader', this.sessionEpoch);
+      // Demote others
+      for (const [id] of this.ports) {
+        if (id !== tabId) this.notifyRole(id, 'standby', this.sessionEpoch);
+      }
+      this._startHeartbeat(tabId);
+      console.log('[bridge-bg] lease acquired by tab', tabId, 'until', new Date(expiry).toISOString());
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  // HEARTBEAT: Current leader renews its lease. Extends expiry by LEASE_TTL_MS.
+  async heartbeat(tabId) {
+    if (this.leaderId !== tabId) return false;
+    try {
+      const expiry = Date.now() + LEASE_TTL_MS;
+      this.leaseExpiry = expiry;
+      await chrome.storage.session.set({ leaseExpiry: expiry });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  // YIELD: Current leader voluntarily gives up leadership. Next tab acquires.
+  async yieldLeadership(tabId) {
+    if (this.leaderId !== tabId) return;
+    console.log('[bridge-bg] tab', tabId, 'yielding leadership');
+    this._stopHeartbeat();
+    this.leaderId = null;
+    this.leaseExpiry = 0;
+    await chrome.storage.session.remove(['leaderTabId', 'leaseExpiry']);
+
+    // Failover: elect next available tab
+    const next = this.ports.keys().next();
+    if (!next.done) {
+      this.acquireLease(next.value);
+    } else {
+      chrome.storage.session.remove('sessionEpoch');
+      console.log('[bridge-bg] no tabs left for leader election');
+    }
+  },
+
+  // REVOKED: Leadership was taken from this tab (failover or lease expired).
+  // Internal transition — notifies the demoted tab.
+  async revokeLease(tabId) {
+    if (this.leaderId !== tabId) return;
+    console.log('[bridge-bg] lease revoked from tab', tabId);
+    this._stopHeartbeat();
+    this.notifyRole(tabId, 'revoked', this.sessionEpoch);
+    this.leaderId = null;
+    this.leaseExpiry = 0;
+    await chrome.storage.session.remove(['leaderTabId', 'leaseExpiry']);
+
+    // Elect next available tab
+    const next = this.ports.keys().next();
+    if (!next.done) {
+      this.acquireLease(next.value);
+    } else {
+      chrome.storage.session.remove('sessionEpoch');
+      console.log('[bridge-bg] no tabs left for leader election');
+    }
+  },
+
+  // ─── Heartbeat Timer ───────────────────────────────────────────────────
+
+  _startHeartbeat(tabId) {
+    this._stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      if (this.leaderId === tabId) {
+        this.heartbeat(tabId);
+      } else {
+        this._stopHeartbeat();
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+  },
+
+  _stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  },
+
+  // ─── Port Management ───────────────────────────────────────────────────
+
+  addTab(tabId, port) {
+    const senderUrl = port.sender?.tab?.url || port.sender?.url || '';
+    if (isSecondaryUrl(senderUrl) || port.name === 'secondary-tab' || secondaryPorts.has(tabId)) {
+      return; // Isolated: secondary tabs never participate in leader coordinator
+    }
+    this.ports.set(tabId, port);
+    // Attempt to acquire lease (first-tab-wins if no active lease)
+    this.acquireLease(tabId);
+  },
+
+  removeTab(tabId) {
+    this.ports.delete(tabId);
+    if (this.leaderId === tabId) {
+      this.revokeLease(tabId);
+    }
+  },
+
+  async setSessionEpoch(epoch, announce = true) {
+    if (epoch == null) return;
+    this.sessionEpoch = epoch;
+    await chrome.storage.session.set({ sessionEpoch: epoch });
+    if (announce) await postBridge({ type: 'SESSION_READY', sessionEpoch: epoch, protocolVersion: 2 });
+    for (const [id] of this.ports) this.notifyRole(id, id === this.leaderId ? 'leader' : 'standby', epoch);
+  },
+
+  notifyRole(tabId, role, sessionEpoch = this.sessionEpoch) {
+    const port = this.ports.get(tabId);
+    if (port) {
+      try {
+        port.postMessage({ type: 'coordinator-role', role, sessionEpoch });
+      } catch { /* port closed */ }
+    }
+  },
+
+  // ─── Leader Query ─────────────────────────────────────────────────────
+
+  getLeaderTabId() {
+    if (this.leaderId && this.leaseExpiry > Date.now()) {
+      return this.leaderId;
+    }
+    // Lease expired — clear local leader and trigger re-election
+    if (this.leaderId && this.leaseExpiry > 0 && this.leaseExpiry <= Date.now()) {
+      console.log('[bridge-bg] leader lease expired for tab', this.leaderId);
+      const expired = this.leaderId;
+      this.leaderId = null;
+      this.leaseExpiry = 0;
+      // Reuse the same logic as revokeLease but without the notification
+      // since the tab may still be around (just missed heartbeats)
+      this.ports.delete(expired);
+      const next = this.ports.keys().next();
+      if (!next.done) {
+        this.acquireLease(next.value);
+      }
+    }
+    return this.leaderId;
+  },
+
+  getLeaderPort() {
+    if (!this.leaderId) return null;
+    return this.ports.get(this.leaderId) || null;
+  },
+};
+
+// A content script and the offscreen document each hold one of these open, which
+// is what stops Chrome evicting the worker.
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'keepalive' && port.name !== 'offscreen-keepalive' && port.name !== 'primary-tab' && port.name !== 'secondary-tab') return;
+  const senderUrl = port.sender?.tab?.url || port.sender?.url || '';
+  const isSecondary = port.name === 'secondary-tab' || isSecondaryUrl(senderUrl);
+
+    if (isSecondary) {
+      const tabId = port.sender?.tab?.id;
+      if (tabId != null) {
+        secondaryPorts.set(tabId, port);
+        if (hubSessionEpoch) {
+          try { port.postMessage({ type: 'SESSION_READY', sessionEpoch: hubSessionEpoch }); } catch {}
+        }
+      }
+    } else if (port.name === 'keepalive' || port.name === 'primary-tab') {
+      const tabId = port.sender?.tab?.id;
+      if (tabId != null) {
+        if (port.name === 'primary-tab') {
+          tabCoordinator.addTab(tabId, port);
+        }
+        // Restore sessionEpoch from storage on (re)connect
+        chrome.storage.session.get(['sessionEpoch', 'leaderTabId', 'leaseExpiry'], (data) => {
+          if (chrome.runtime.lastError) return;
+          if (hubSessionEpoch) {
+            tabCoordinator.sessionEpoch = hubSessionEpoch;
+          } else if (data.sessionEpoch) {
+            tabCoordinator.sessionEpoch = data.sessionEpoch;
+          }
+          if (hubSessionEpoch || tabCoordinator.sessionEpoch) {
+            try {
+              port.postMessage({
+                type: 'SESSION_READY',
+                sessionEpoch: hubSessionEpoch || tabCoordinator.sessionEpoch,
+              });
+            } catch {}
+          }
+          // If we have a tab and there's an expired lease, try to acquire
+          if (data.leaderTabId && data.leaseExpiry && data.leaseExpiry < Date.now()) {
+            tabCoordinator.acquireLease(tabId);
+          }
+        });
+      }
+    }
+    void reportPagesToHub();
+    connect(); // a tab just appeared, or the worker just woke
+    connectBridge();
+    port.onMessage.addListener(() => {});
+
+    port.onDisconnect.addListener(() => {
+      void chrome.runtime.lastError;
+      if (port.name === 'offscreen-keepalive') ensureOffscreenDocument();
+      if (isSecondary || port.name === 'secondary-tab') {
+        if (port.sender?.tab?.id != null) {
+          secondaryPorts.delete(port.sender.tab.id);
+        }
+      } else if (port.name === 'primary-tab' && port.sender?.tab?.id != null) {
+        tabCoordinator.removeTab(port.sender.tab.id);
+      }
+      void reportPagesToHub();
+    });
+  });
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  tabCoordinator.removeTab(tabId);
+  secondaryPorts.delete(tabId);
+  void reportPagesToHub();
+});
+
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+  if (changeInfo.status === 'complete' && (isPrimaryUrl(tab?.url) || isSecondaryUrl(tab?.url))) {
+    void reportPagesToHub();
+  }
+});
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === 'from-page') {
+    const p = msg.payload;
+    if (!p || typeof p !== 'object') return;
+    const senderTabId = _sender?.tab?.id;
+    const senderUrl = _sender?.tab?.url || _sender?.url || '';
+    const isValidProviderTab = isPrimaryUrl(senderUrl) || isSecondaryUrl(senderUrl);
+
+    if (p.kind === 'chunk' || p.kind === 'done' || p.kind === 'error' || p.kind === 'loader') {
+      const record = jobTabs.get(p.jobId);
+      if (!record || senderTabId == null || senderTabId !== record.tabId) {
+        console.warn('[bridge-bg] rejected untrusted or stale from-page message', {
+          jobId: p.jobId,
+          kind: p.kind,
+          senderTabId,
+          expectedTabId: record?.tabId,
+        });
+        return;
+      }
+      const epoch = p.sessionEpoch ?? hubSessionEpoch ?? tabCoordinator.sessionEpoch;
+      if (p.kind === 'chunk') post('/ext/chunk', { jobId: p.jobId, parts: p.parts, sessionEpoch: epoch });
+      else if (p.kind === 'done') { jobTabs.delete(p.jobId); post('/ext/done', { jobId: p.jobId, finishReason: p.finishReason, sessionEpoch: epoch }); }
+      else if (p.kind === 'error') {
+        void retryAfterCloudflare(p.jobId, p.message).then((retried) => {
+          if (!retried) {
+            jobTabs.delete(p.jobId);
+            post('/ext/error', { jobId: p.jobId, message: p.message, sessionEpoch: epoch });
+          }
+        });
+      }
+      else if (p.kind === 'loader') { jobTabs.delete(p.jobId); post('/ext/loader', { jobId: p.jobId, raw: p.raw, message: p.message, sessionEpoch: epoch }); }
+    }
+
+    // Protocol v2 messages from page.js (only accept from scoped provider tabs)
+    if (senderTabId != null && isValidProviderTab && (
+      p.type === 'MODELS_DISCOVERED' || p.type === 'MODEL_READY'
+      || p.type === 'STREAM_CHUNK' || p.type === 'STREAM_DONE'
+      || p.type === 'STREAM_ERROR' || p.type === 'SESSION_READY'
+      || p.type === 'MODEL_UPDATED' || p.kind === 'models_discovered'
+    )) {
+      if ((p.type === 'MODELS_DISCOVERED' || p.kind === 'models_discovered') && Array.isArray(p.models) && p.models.length) {
+        const isSecondary = isSecondaryUrl(senderUrl);
+        if (isSecondary) {
+          siteModels.secondary = p.models.map((m) => ({ ...m, provider: 'Secondary Provider' }));
+        } else {
+          siteModels.primary = p.models.map((m) => ({ ...m, provider: m.provider || 'Primary Provider' }));
+        }
+      }
+      postBridge(p);
+    }
+    return;
+  }
+
+  // ─── Native Direct Request Handler ──────────────────────────────────────
+  // Forwards native requests (with custom parameters, reasoning, etc.) 
+  // directly to target origin without OpenAI translation
+  if (msg?.type === 'NATIVE_REQUEST' || msg?.type === 'DIRECT_REQUEST') {
+    const payload = msg.payload;
+    (async () => {
+      try {
+        const tab = await findPrimaryTab();
+        if (!tab) {
+          sendResponse({ success: false, error: 'no primary target tab is open' });
+          return;
+        }
+        await ensureContentScript(tab);
+        
+        await chrome.tabs.sendMessage(tab.id, { 
+          type: 'NATIVE_REQUEST', 
+          payload,
+          jobId: crypto.randomUUID() 
+        });
+        
+        sendResponse({ success: true, message: 'forwarded to primary target' });
+      } catch (err) {
+        sendResponse({ success: false, error: String(err.message || err) });
+      }
+    })();
+    return true; // async response
+  }
+
+  // ─── Lease State Machine Messages ──────────────────────────────────────
+  // Content scripts use these to participate in leader election.
+  // STRICT ISOLATION: Secondary tabs do NOT participate in primary leader election.
+  if (msg?.type === 'acquire_lease') {
+    const senderUrl = _sender?.tab?.url || _sender?.url || '';
+    if (isSecondaryUrl(senderUrl) || (_sender?.tab?.id != null && secondaryPorts.has(_sender.tab.id))) {
+      sendResponse({ ok: false, reason: 'secondary_isolated' });
+      return true;
+    }
+    const tabId = _sender?.tab?.id;
+    if (tabId != null) {
+      tabCoordinator.acquireLease(tabId).then((ok) => {
+        sendResponse({ ok, leader: tabCoordinator.leaderId === tabId });
+      });
+      return true; // async response
+    }
+    sendResponse({ ok: false });
+    return true;
+  }
+
+  if (msg?.type === 'heartbeat') {
+    const senderUrl = _sender?.tab?.url || _sender?.url || '';
+    if (isSecondaryUrl(senderUrl) || (_sender?.tab?.id != null && secondaryPorts.has(_sender.tab.id))) {
+      sendResponse({ ok: false, reason: 'secondary_isolated' });
+      return true;
+    }
+    const tabId = _sender?.tab?.id;
+    if (tabId != null) {
+      tabCoordinator.heartbeat(tabId).then((ok) => {
+        sendResponse({ ok, leader: tabCoordinator.leaderId === tabId, leaseExpiry: tabCoordinator.leaseExpiry });
+      });
+      return true;
+    }
+    sendResponse({ ok: false });
+    return true;
+  }
+
+  if (msg?.type === 'yield_leadership') {
+    const senderUrl = _sender?.tab?.url || _sender?.url || '';
+    if (isSecondaryUrl(senderUrl) || (_sender?.tab?.id != null && secondaryPorts.has(_sender.tab.id))) {
+      sendResponse({ ok: true, reason: 'secondary_isolated' });
+      return true;
+    }
+    const tabId = _sender?.tab?.id;
+    if (tabId != null) {
+      tabCoordinator.yieldLeadership(tabId);
+      sendResponse({ ok: true });
+    }
+    return true;
+  }
+
+  if (msg?.type === 'get_lease_state') {
+    const senderUrl = _sender?.tab?.url || _sender?.url || '';
+    if (isSecondaryUrl(senderUrl) || (_sender?.tab?.id != null && secondaryPorts.has(_sender.tab.id))) {
+      sendResponse({
+        leaderId: null,
+        leaseExpiry: 0,
+        sessionEpoch: 0,
+        isLeader: false,
+        isolated: true,
+      });
+      return true;
+    }
+    sendResponse({
+      leaderId: tabCoordinator.leaderId,
+      leaseExpiry: tabCoordinator.leaseExpiry,
+      sessionEpoch: tabCoordinator.sessionEpoch,
+      isLeader: _sender?.tab?.id === tabCoordinator.leaderId,
+    });
+    return true;
+  }
+
+  if (msg?.type === 'status') {
+    (async () => {
+      const tab = await findChatTab();
+      const pages = await getPagesStatus();
+      sendResponse({
+        connected,
+        bridgeConnected,
+        lastError,
+        bridgeUrl: await bridgeUrl(),
+        tab: tab ? { id: tab.id, url: tab.url } : null,
+        activeJobs: jobTabs.size,
+        pages,
+      });
+    })();
+    return true;
+  }
+  if (msg?.type === 'pages_status') {
+    (async () => {
+      const pages = await getPagesStatus();
+      sendResponse({ ok: true, pages });
+    })();
+    return true;
+  }
+  if (msg?.type === 'open_page') {
+    const targetUrl = msg.url || 'https://target.example.local/chat';
+    (async () => {
+      const matchPattern = isSecondaryUrl(targetUrl) ? 'https://secondary.example.local/*' : 'https://target.example.local/*';
+      const existing = await chrome.tabs.query({ url: matchPattern }).catch(() => []);
+      if (existing.length && existing[0]?.id) {
+        await chrome.tabs.update(existing[0].id, { active: true });
+        if (existing[0].windowId) await chrome.windows.update(existing[0].windowId, { focused: true });
+        sendResponse({ ok: true, tabId: existing[0].id, switched: true });
+      } else {
+        const tab = await chrome.tabs.create({ url: targetUrl });
+        sendResponse({ ok: true, tabId: tab.id, created: true });
+      }
+    })();
+    return true;
+  }
+  if (msg?.type === 'scan_pages') {
+    (async () => {
+      const tabs = await chrome.tabs.query({
+        url: [
+          'https://target.example.local/*',
+          'https://secondary.example.local/*',
+        ],
+      }).catch(() => []);
+      for (const t of tabs) {
+        chrome.tabs.sendMessage(t.id, { type: 'discover_models' }).catch(() => {});
+      }
+      const pages = await getPagesStatus();
+      sendResponse({ ok: true, scannedCount: tabs.length, pages });
+    })();
+    return true;
+  }
+  if (msg?.type === 'reconnect') { controller?.abort(); bridgeController?.abort(); connect(); connectBridge(); sendResponse({ ok: true }); return true; }
+});
+
+// The worker can still be evicted; the alarm brings it back, and the connect()
+// guard makes a duplicate call harmless.
+chrome.alarms.create('keepalive', { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener(() => {
+  ensureOffscreenDocument();
+  connect();
+  connectBridge();
+});
+
+async function initDefaults() {
+  try {
+    const existing = await chrome.storage.local.get(['bridgeUrl', 'bridgeToken', 'userConfigured']);
+    const updates = {};
+    if (!existing.bridgeUrl || (!existing.userConfigured && (existing.bridgeUrl === 'http://127.0.0.1:8787' || existing.bridgeUrl === 'http://localhost:8787'))) {
+      updates.bridgeUrl = DEFAULT_BRIDGE;
+    }
+    if (existing.bridgeToken && isUnresolvedToken(String(existing.bridgeToken).trim())) {
+      await chrome.storage.local.remove('bridgeToken');
+    } else if (!existing.bridgeToken && !isUnresolvedToken(DEFAULT_REMOTE_TOKEN)) {
+      updates.bridgeToken = DEFAULT_REMOTE_TOKEN;
+    }
+    if (Object.keys(updates).length > 0) {
+      await chrome.storage.local.set(updates);
+    }
+  } catch (err) {
+    console.warn('[bridge-bg] error initializing storage defaults:', err);
+  }
+}
+
+chrome.runtime.onStartup.addListener(async () => {
+  await initDefaults();
+  ensureOffscreenDocument();
+  connect();
+  connectBridge();
+});
+
+chrome.runtime.onInstalled.addListener(async () => {
+  await initDefaults();
+  ensureOffscreenDocument();
+  connect();
+  connectBridge();
+});
+
+// Initialize immediately
+void initDefaults().then(() => {
+  ensureOffscreenDocument();
+  connect();
+  connectBridge();
+});

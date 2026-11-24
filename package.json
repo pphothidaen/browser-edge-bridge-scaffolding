@@ -1,0 +1,16 @@
+{
+  "name": "browser-edge-bridge-scaffolding",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "test": "node --test test/test-cf-worker.test.mjs test/test-config-loader.test.mjs test/test-verify-deploy.test.mjs test/release-packaging.test.mjs packages/checks-runner/run-check.test.js",
+    "test:core": "npm test --prefix packages/core",
+    "verify:deploy": "node scripts/verify_deploy.mjs",
+    "gemini": "bash scripts/gemini",
+    "release": "node scripts/release.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "playwright": "^1.63.0"
+  }
+}

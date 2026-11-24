@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "name": "browser-edge-bridge-configuration",
+  "version": "1.0.0",
+  "targetOrigins": [
+    "https://target.example.local/*"
+  ],
+  "providers": {
+    "default-provider": {
+      "name": "Default Provider",
+      "url": "https://target.example.local/chat",
+      "matchPatterns": [
+        "https://target.example.local/*"
+      ],
+      "models": [
+        {
+          "id": "model-example",
+          "name": "Default Example Model",
+          "free": true,
+          "kind": "chat",
+          "provider": "default-provider"
+        },
+        {
+          "id": "model-fast",
+          "name": "Fast Example Model",
+          "free": true,
+          "kind": "chat",
+          "provider": "default-provider"
+        },
+        {
+          "id": "model-reasoning",
+          "name": "Reasoning Example Model",
+          "free": false,
+          "kind": "chat",
+          "provider": "default-provider"
+        }
+      ],
+      "endpoints": {
+        "chat": "/api/chat",
+        "models": "/api/models",
+        "conversations": "/api/conversations"
+      },
+      "selectors": {
+        "chatInput": "textarea[data-testid='chat-input']",
+        "sendButton": "button[data-testid='send-button']"
+      }
+    }
+  },
+  "defaultProvider": "default-provider",
+  "defaultModel": "model-example",
+  "fallbackModels": [
+    "model-example",
+    "model-fast",
+    "model-reasoning"
+  ],
+  "runtimeLimits": {
+    "maxQueueSize": 10,
+    "jobTimeoutMs": 120000,
+    "maxPayloadBytes": 10485760
+  }
+}

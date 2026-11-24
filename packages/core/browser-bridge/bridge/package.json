@@ -1,0 +1,14 @@
+{
+  "name": "browser-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible local endpoint relaying authenticated browser tab sessions.",
+  "scripts": {
+    "start": "node server.mjs",
+    "mcp-agent": "node mcp-agent.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
